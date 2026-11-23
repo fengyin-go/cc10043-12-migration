@@ -79,5 +79,50 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 载荷编码迁移与版本化回放（`backend/app/migration/`）
+
+把连接器直写的 Python 字面量（历史订单保留 `True` / `None`）迁移为带版本标识的
+JSON 信封 `json.envelope.v2`，接入与回放两个入口共用一个追加式版本仓。
+
+- `registry.py`：接入来源与原写入格式登记表。旧载荷按**来源 + 原写入格式**核验，
+  文本相同但来源不同的载荷分类键不同、不会归并；来源不明保留原文并标记无法转换。
+- `codec.py`：`ast.literal_eval` 安全解析旧字面量（拒绝任何调用表达式）；信封带
+  `enc` 编码版本与 `data_sha256` 哈希，读取时先验版本再验哈希，篡改即拒绝。
+- `store.py`：线程安全的追加式版本仓。迁移只追加新版本、不改写旧版本；每条版本带
+  单调 `seq`，回放请求受理时冻结 `cutoff_seq` 水位。
+- `service.py`：迁移批次（预备 → 切换前核对 → 发布 / 撤回）与回放编排（受理冻结、
+  中断续跑、重跑幂等、回滚对账）。撤回只翻发布位，回放回落到仍可读的 v1 原载荷。
+- 前端「载荷迁移控制台」（导航第二项，路由 `/migration-console`）覆盖两个入口的
+  全部操作与版本查询。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/migration/sources` | 来源登记与原写入格式 |
+| POST | `/api/migration/legacy/load` | 装载存量 Python 字面量载荷 |
+| POST | `/api/ingress/json` | 新接收入口（仅接受通过核验的 v2 信封） |
+| POST | `/api/migration/prepare` | 预备迁移批次（生成未发布 v2 与核验明细） |
+| POST | `/api/migration/batches/{id}/verify` | 批次发布前核对（版本/哈希/原文重验） |
+| POST | `/api/migration/batches/{id}/publish` | 发布批次（内部先核对，失败不发布） |
+| POST | `/api/migration/batches/{id}/withdraw` | 撤回当前批次发布 |
+| POST | `/api/migration/pre-cutover-check` | 切换前核对存量数据与示例数据 |
+| POST | `/api/replay/open` | 受理回放请求并冻结水位 |
+| POST | `/api/replay/{id}/run` | 执行回放（可带 limit 模拟中断点） |
+| POST | `/api/replay/{id}/interrupt` `/resume` | 中断与恢复（台账按消息身份去重） |
+| GET | `/api/replay/{id}/reconcile` | 重跑/回滚后核对实际交付与确认范围 |
+| GET | `/api/migration/versions` | 查询各消息当前可见版本与数据 |
+
+### 验证
+
+```bash
+cd backend
+python3 -I -m unittest discover -s tests          # 17 个标准库单元测试，含并发冲突
+python3 -I scripts/migration_demo.py              # 端到端剧情：同文异源、中断插入 C、恢复隔离、撤回回落
+.venv/bin/python scripts/http_smoke.py            # 不依赖 httpx 的路由冒烟（最小 ASGI 调用器）
+.venv/bin/python -m uvicorn app.main:app --port 8017
+python3 -I scripts/live_scenario.py               # 对运行中服务跑真实 HTTP 场景
+```
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA
